@@ -22,6 +22,11 @@ centroid of the pad / hole / pin under the cursor, so you get sub-pixel accuracy
 - **Perspective**: click the 4 corners of something rectangular, drag the corners to fine-tune, then press
   **Enter** (or *Apply warp*), and the image is warped square-on. Optionally type
   its real W × H to set the exact proportions and the scale in one go.
+- **Square L**: for objects with a 90-degree corner that aren't rectangles. Draw an L along the corner (end of one
+  edge → the corner → end of the other edge), drag the points to adjust, press **Enter**. The first arm snaps to the
+  nearest axis and the second becomes exactly perpendicular. This removes shear/skew (an affine correction), which
+  is ideal for scans, screenshots and roughly straight-on photos. For strongly angled photos, where parallel edges
+  converge, use Perspective. Optionally type the arms' real lengths to fix their proportions and set the scale.
 - **Mirror / rotate 90°**, unlimited **undo** (including rotations and warps).
 - **Save** (`Ctrl+S`) bundles the image, every shape, the scale and the view into one `.ijay` file. It's a zip with
   `image.png`, `session.json` and `measurements.csv`, so it's readable without the app too.
@@ -32,7 +37,7 @@ centroid of the pad / hole / pin under the cursor, so you get sub-pixel accuracy
 |---|---|---|---|
 | L | line | K | scale |
 | R | rectangle | A | straighten |
-| C | circle | W | perspective |
+| C | circle | W / J | perspective / square L |
 | P | point | S | toggle snap |
 | O | origin | F / 1 | fit / 100 % |
 | Ctrl+O / V / S / Z | open / paste / save / undo | Del, Esc | delete selected, cancel |
@@ -46,6 +51,9 @@ Mouse wheel zooms around the cursor; right or middle drag pans.
 pip install -r requirements.txt
 python image_jay.py            (or double-click "Image Jay.bat")
 ```
+
+For development, create a `dev_launch.bat` (gitignored) next to the script that runs `python image_jay.py %*`
+in a console, so tracebacks stay visible while you edit. Rebuild and reinstall when you're happy.
 
 ## Build and install (Windows)
 

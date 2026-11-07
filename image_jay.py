@@ -1,8 +1,9 @@
 """Image Jay - measure real-world dimensions from photos / screenshots, sketch-style.
 
 Workflow
-  1. Fix the image (optional): Straighten (draw along an edge that should be level) or Perspective
-     (click the 4 corners of something rectangular; it gets warped square-on, optionally to a known size).
+  1. Fix the image (optional): Straighten (draw along an edge that should be level), Perspective
+     (click the 4 corners of something rectangular; it gets warped square-on, optionally to a known size),
+     or Square L (draw an L along any 90-degree corner; the shear/skew is removed so the corner is square).
   2. Scale: click two points of known separation (e.g. first and last header pin) and type the real distance
      (math OK: 3*2.54), or type mm/px in the side panel.
   3. Origin (optional): coordinates are reported relative to it.
@@ -38,9 +39,12 @@ TOOLS = [("Line", "l", "click/drag two points: length + angle", True, True),
          ("Origin", "o", "click: set the origin", True, None),
          ("Scale", "k", "click two points of known separation, then type the real distance", True, True),
          ("Straighten", "a", "draw along an edge that should be level/plumb: the image rotates to match", False, False),
-         ("Perspective", "w", "click the 4 corners of a rectangular object, drag them to adjust, Enter to warp", False, False)]
+         ("Perspective", "w", "click the 4 corners of a rectangular object, drag them to adjust, Enter to warp", False, False),
+         ("Square L", "j", "draw an L along a 90° corner: end of one edge, the corner, end of the other edge; "
+                           "Enter squares it up", False, False)]
 TOOL = {t[0]: t for t in TOOLS}
-NO_EDIT_TOOLS = ("Origin", "Straighten", "Perspective")
+NO_EDIT_TOOLS = ("Origin", "Straighten", "Perspective", "Square L")
+QUAD_TOOLS = {"Perspective": 4, "Square L": 3}  # point-placing correction tools: points needed
 PALETTE = ["#ffd400", "#00e5ff", "#39ff14", "#ff8c00", "#4d9dff", "#ff4d6d", "#b388ff", "#00ffa3",
            "#ffe066", "#7ef9ff", "#ff9ecf", "#c6ff00", "#ffb347", "#66ffcc", "#e0e0e0", "#ff6ef0"]
 SCALE_COL, ORIGIN_COL, SEL_COL, LIVE_COL, BLOB_COL = "#ff3df2", "#ff3030", "#ffffff", "#ffffff", "#00ff9c"
@@ -540,16 +544,76 @@ class App:
         except np.linalg.LinAlgError:
             messagebox.showerror(APP, "Those 4 points don't form a usable quadrilateral (3 in a line?).")
             return
-        # output bounds: the whole image if it maps sanely, else the rectangle plus a generous margin
+        F, k = self._warp(H, wpx, hpx)
+        if real:
+            self.items = [it for it in self.items if it["type"] != "Scale"]
+            self.mm_per_px = real[0] / (wpx * k)
+            self.add({"type": "Rect", "pts": [apply_h(F, tl), apply_h(F, br)], "blobs": [None, None],
+                      "note": f"reference {real[0]:g} x {real[1]:g} mm"}, snapshot=False)
+        self.fit()
+        self.refresh_all()
+        return True
+
+    def square_l(self, a, c, b):
+        """Affine correction from an L: arm c->a snaps to the nearest axis, arm c->b becomes exactly 90 deg to it."""
+        L1, L2 = math.dist(a, c), math.dist(b, c)
+        v1, v2 = (a[0] - c[0], a[1] - c[1]), (b[0] - c[0], b[1] - c[1])
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        if L1 < 2 or L2 < 2 or abs(cross) < 1e-6 * L1 * L2 + 1e-9:
+            messagebox.showwarning(APP, "Draw an L: two arms of real length that aren't in a line.")
+            return
+        s = simpledialog.askstring(APP, f"Arm 1 (first point -> corner) is {L1:.0f} px,\n"
+                                        f"arm 2 (corner -> last point) is {L2:.0f} px.\n\n"
+                                        "Real arm lengths in mm, 'arm1 x arm2' (optional, e.g. 30 x 12)\n"
+                                        "- sets their proportions and the scale.\n"
+                                        "Leave blank to keep the measured lengths.", parent=self.root)
+        if s is None:
+            self.redraw()
+            return
+        real = None
+        if s.strip():
+            m = re.match(r"^\s*([0-9.eE+\-*/() ]+?)\s*[xX×,]\s*([0-9.eE+\-*/() ]+)\s*$", s)
+            try:
+                if not m:
+                    raise ValueError("type it as arm1 x arm2, e.g. 30 x 12")
+                real = (eval_number(m.group(1)), eval_number(m.group(2)))
+            except ValueError as err:
+                messagebox.showerror(APP, str(err))
+                return
+            L2 = L1 * real[1] / real[0]
+        th = round(math.atan2(v1[1], v1[0]) / (math.pi / 2)) * (math.pi / 2)
+        u1 = (math.cos(th), math.sin(th))
+        u2 = (-u1[1], u1[0]) if cross > 0 else (u1[1], -u1[0])  # keep the L's handedness (no mirroring)
+        da = (c[0] + L1 * u1[0], c[1] + L1 * u1[1])
+        db = (c[0] + L2 * u2[0], c[1] + L2 * u2[1])
+        # an affine map is fixed by 3 points; the parallelogram's 4th corner makes it a (degenerate) homography
+        H = homography([a, c, b, (a[0] + b[0] - c[0], a[1] + b[1] - c[1])],
+                       [da, c, db, (da[0] + db[0] - c[0], da[1] + db[1] - c[1])])
+        F, k = self._warp(H, L1, L2)
+        if real:
+            self.items = [it for it in self.items if it["type"] != "Scale"]
+            self.mm_per_px = real[0] / (L1 * k)
+            for p_end in (a, b):
+                self.add({"type": "Line", "pts": [apply_h(F, c), apply_h(F, p_end)], "blobs": [None, None]},
+                         snapshot=False)
+        self.fit()
+        self.refresh_all()
+        return True
+
+    def _warp(self, H, ex, ey):
+        """Warp the image by homography H (source px -> corrected px). The output covers the whole image when it
+        maps sanely, else the reference region plus a margin; capped at MAX_WARP_PX. Returns (F, k): the final
+        source->output map and the extra downscale factor."""
         w, h = self.img.size
         corners = [(0, 0), (w, 0), (w, h), (0, h)]
         ws = [(H @ np.array([x, y, 1.0]))[2] for x, y in corners]
         mapped = [apply_h(H, p) for p in corners]
         xs, ys = [p[0] for p in mapped], [p[1] for p in mapped]
-        if min(ws) > 0 and max(xs) - min(xs) < 6 * wpx + w and max(ys) - min(ys) < 6 * hpx + h:
+        ext = max(ex, ey)
+        if min(ws) > 0 and max(xs) - min(xs) < 6 * ext + w and max(ys) - min(ys) < 6 * ext + h:
             bx0, by0, bx1, by1 = min(xs), min(ys), max(xs), max(ys)
         else:
-            bx0, by0, bx1, by1 = -wpx, -hpx, 2 * wpx, 2 * hpx
+            bx0, by0, bx1, by1 = -ext, -ext, 2 * ext, 2 * ext
         k = min(1.0, MAX_WARP_PX / max(bx1 - bx0, by1 - by0))
         F = np.array([[k, 0, -k * bx0], [0, k, -k * by0], [0, 0, 1]]) @ H  # source px -> output px
         G = np.linalg.inv(F)
@@ -561,14 +625,7 @@ class App:
         self.arr = np.asarray(self.img)
         self._transform_all(lambda p: apply_h(F, p))
         self.warped = True
-        if real:
-            self.items = [it for it in self.items if it["type"] != "Scale"]
-            self.mm_per_px = real[0] / (wpx * k)
-            self.add({"type": "Rect", "pts": [apply_h(F, tl), apply_h(F, br)], "blobs": [None, None],
-                      "note": f"reference {real[0]:g} x {real[1]:g} mm"}, snapshot=False)
-        self.fit()
-        self.refresh_all()
-        return True
+        return F, k
 
     # ================================================================== view
     def to_canvas(self, x, y):
@@ -752,11 +809,11 @@ class App:
             return
         tool = self.tool.get()
         _, _, _, snap1, snap2 = TOOL[tool]
-        if tool == "Perspective":
+        if tool in QUAD_TOOLS:
             k = self.quad_corner_at(e.x, e.y)
             if k is not None:            # grab a corner to adjust it
                 self.quad_drag = k
-            elif len(self.quad) < 4:     # place the next corner
+            elif len(self.quad) < QUAD_TOOLS[tool]:  # place the next point
                 self.quad.append(self.to_image(e.x, e.y))
             self.redraw()
             self.update_status()
@@ -793,8 +850,11 @@ class App:
         return None
 
     def apply_warp(self):
-        if len(self.quad) == 4 and self.perspective(list(self.quad)):
-            self.quad = []
+        need = QUAD_TOOLS.get(self.tool.get())
+        if need and len(self.quad) == need:
+            ok = self.perspective(list(self.quad)) if need == 4 else self.square_l(*self.quad)
+            if ok:
+                self.quad = []
         self.redraw()
         self.update_status()
 
@@ -853,7 +913,7 @@ class App:
             if self.active:
                 self.active["p2"] = self.to_image(e.x, e.y)
             self.redraw()
-        if self.tool.get() == "Perspective":
+        if self.tool.get() in QUAD_TOOLS:
             self.cv.config(cursor="fleur" if self.quad_corner_at(e.x, e.y) is not None else "crosshair")
         else:
             hit = None if (self.active or self.tool.get() in NO_EDIT_TOOLS or self.img is None) \
@@ -1029,14 +1089,16 @@ class App:
                     parts.append(f"rotate by {-(ang - round(ang / 90) * 90):+.2f}°")
                 else:
                     parts.append(f"live {self.L(math.hypot(qx - px, qy - py))} {self.unit}")
-            if len(self.quad) == 4:
-                parts.append("drag corners to adjust, Enter / Apply warp to transform, Esc to cancel")
+            need = QUAD_TOOLS.get(self.tool.get(), 4)
+            if len(self.quad) == need:
+                parts.append("drag points to adjust, Enter / Apply warp to transform, Esc to cancel")
             elif self.quad:
-                parts.append(f"corner {len(self.quad) + 1} of 4")
+                parts.append(f"point {len(self.quad) + 1} of {need}")
             if self.shift:
                 parts.append("SNAP " + ("OFF" if self.snap.get() else "ON") + " (Shift)")
         parts.append(f"zoom {self.z * 100:.0f}%")
-        self.apply_btn.config(state="normal" if len(self.quad) == 4 else "disabled")
+        need = QUAD_TOOLS.get(self.tool.get())
+        self.apply_btn.config(state="normal" if need and len(self.quad) == need else "disabled")
         parts.append(f"{self.tool.get()}: {TOOL[self.tool.get()][2]}")
         self.status.config(text="     ".join(parts))
 
@@ -1140,8 +1202,18 @@ class App:
             self.draw_shape(a["type"], a["p1"], a["p2"], LIVE_COL, width=1, dash=(4, 4))
         if self.quad:
             placed = [self.to_canvas(*p) for p in self.quad]
-            if len(placed) == 4:   # complete: solid outline, ready to adjust / apply
-                c.create_polygon(*[v for p in placed for v in p], outline=QUAD_COL, fill="", width=2)
+            need = QUAD_TOOLS.get(self.tool.get(), 4)
+            if len(placed) == need:   # complete: solid outline, ready to adjust / apply
+                if need == 4:
+                    c.create_polygon(*[v for p in placed for v in p], outline=QUAD_COL, fill="", width=2)
+                else:  # the L, with a right-angle mark at the corner
+                    c.create_line(*[v for p in placed for v in p], fill=QUAD_COL, width=3)
+                    (ax, ay), (cx_, cy_), (bx, by) = placed
+                    la, lb = math.hypot(ax - cx_, ay - cy_) or 1, math.hypot(bx - cx_, by - cy_) or 1
+                    m = min(14, la / 3, lb / 3)
+                    pa = (cx_ + (ax - cx_) / la * m, cy_ + (ay - cy_) / la * m)
+                    pb = (cx_ + (bx - cx_) / lb * m, cy_ + (by - cy_) / lb * m)
+                    c.create_line(*pa, pa[0] + pb[0] - cx_, pa[1] + pb[1] - cy_, *pb, fill=QUAD_COL, width=2)
                 xs, ys = [p[0] for p in placed], [p[1] for p in placed]
                 self._label(min(xs), min(ys) - 14, "drag corners to adjust · Enter = apply warp · Esc = cancel",
                             QUAD_COL)
@@ -1149,15 +1221,16 @@ class App:
                 pts = placed + ([self.cursor] if self.cursor else [])
                 if len(pts) > 1:
                     c.create_line(*[v for p in pts for v in p], fill=LIVE_COL, dash=(4, 4), width=2)
-                if len(pts) == 4:
+                if len(pts) == 4 and need == 4:
                     c.create_line(*pts[-1], *pts[0], fill=LIVE_COL, dash=(2, 4))
             for k, p in enumerate(placed):
-                col = QUAD_COL if len(placed) == 4 else LIVE_COL
+                col = QUAD_COL if len(placed) == need else LIVE_COL
                 c.create_oval(p[0] - 6, p[1] - 6, p[0] + 6, p[1] + 6, outline=col, width=2,
                               fill="#000000" if k == self.quad_drag else "")
                 c.create_line(p[0] - 3, p[1], p[0] + 3, p[1], fill=col)
                 c.create_line(p[0], p[1] - 3, p[0], p[1] + 3, fill=col)
-                c.create_text(p[0] + 11, p[1] - 11, text=str(k + 1), fill=col, font=("Segoe UI", 10, "bold"))
+                txt = ("end 1", "corner", "end 2")[k] if need == 3 else str(k + 1)
+                c.create_text(p[0] + 11, p[1] - 11, text=txt, fill=col, font=("Segoe UI", 10, "bold"), anchor="w")
 
 
 def main():

@@ -4,3 +4,4 @@ dist/
 __pycache__/
 *.pyc
 *.ijay
+dev_launch.bat
