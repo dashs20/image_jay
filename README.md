@@ -14,11 +14,13 @@ centroid of the pad / hole / pin under the cursor, so you get sub-pixel accuracy
 - **Shapes**: line (length, angle, Δx/Δy), rectangle (corner to corner), circle (centre then radius, like a
   SolidWorks sketch), point. Click-click or click-drag.
 - **Snap to blob**: clicks snap to the centroid of the region of similar colour under the cursor (adjustable tolerance).
+  Hold **Shift** while clicking to flip snapping for that click.
 - **Edit**: drag line ends, rectangle edges/corners, circle rim/centre. A plain click on a handle starts a new shape
   there instead, so you can centre a circle on a line's end. Lock shapes in the table so the mouse can't grab them.
 - **Colour-coded dimension table**: each shape's row matches its colour. Copy as text or export CSV.
 - **Straighten**: draw along an edge that should be level or plumb, and the image rotates to match.
-- **Perspective**: click the 4 corners of something rectangular, and the image is warped square-on. Optionally type
+- **Perspective**: click the 4 corners of something rectangular, drag the corners to fine-tune, then press
+  **Enter** (or *Apply warp*), and the image is warped square-on. Optionally type
   its real W × H to set the exact proportions and the scale in one go.
 - **Mirror / rotate 90°**, unlimited **undo** (including rotations and warps).
 - **Save** (`Ctrl+S`) bundles the image, every shape, the scale and the view into one `.ijay` file. It's a zip with
@@ -34,6 +36,7 @@ centroid of the pad / hole / pin under the cursor, so you get sub-pixel accuracy
 | P | point | S | toggle snap |
 | O | origin | F / 1 | fit / 100 % |
 | Ctrl+O / V / S / Z | open / paste / save / undo | Del, Esc | delete selected, cancel |
+| Shift (hold) | flip snapping | Enter | apply perspective warp |
 
 Mouse wheel zooms around the cursor; right or middle drag pans.
 

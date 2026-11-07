@@ -38,12 +38,13 @@ TOOLS = [("Line", "l", "click/drag two points: length + angle", True, True),
          ("Origin", "o", "click: set the origin", True, None),
          ("Scale", "k", "click two points of known separation, then type the real distance", True, True),
          ("Straighten", "a", "draw along an edge that should be level/plumb: the image rotates to match", False, False),
-         ("Perspective", "w", "click the 4 corners of a rectangular object: the image is warped square-on", False, False)]
+         ("Perspective", "w", "click the 4 corners of a rectangular object, drag them to adjust, Enter to warp", False, False)]
 TOOL = {t[0]: t for t in TOOLS}
 NO_EDIT_TOOLS = ("Origin", "Straighten", "Perspective")
 PALETTE = ["#ffd400", "#00e5ff", "#39ff14", "#ff8c00", "#4d9dff", "#ff4d6d", "#b388ff", "#00ffa3",
            "#ffe066", "#7ef9ff", "#ff9ecf", "#c6ff00", "#ffb347", "#66ffcc", "#e0e0e0", "#ff6ef0"]
 SCALE_COL, ORIGIN_COL, SEL_COL, LIVE_COL, BLOB_COL = "#ff3df2", "#ff3030", "#ffffff", "#ffffff", "#00ff9c"
+QUAD_COL = "#ffb000"
 HIT = 7            # handle grab distance, screen px
 MAX_WARP_PX = 8000  # cap on the warped image's longest side
 SAFE_EXPR = re.compile(r"^[0-9eE+\-*/(). ]+$")
@@ -164,7 +165,9 @@ class App:
         self.rotation = 0.0       # total rotation from Straighten / 90° buttons (deg, CCW)
         self.warped = False       # perspective-corrected?
         self.active = None        # 2-point shape being drawn
-        self.quad = []            # perspective corners being clicked
+        self.quad = []            # perspective corners (editable until applied)
+        self.quad_drag = None     # index of the perspective corner being dragged
+        self.shift = False        # Shift held: invert snapping
         self.edit = None          # (item index, handle) being dragged
         self.maybe_edit = None    # handle pressed, waiting to see if it's a drag
         self.history = []         # undo snapshots
@@ -221,6 +224,8 @@ class App:
         ttk.Button(bar, text="⟲90", width=5, command=lambda: self.rotate(90)).pack(side="left", padx=1)
         ttk.Button(bar, text="⟳90", width=5, command=lambda: self.rotate(-90)).pack(side="left", padx=1)
         ttk.Button(bar, text="Fit [F]", command=self.fit).pack(side="left", padx=(4, 0))
+        self.apply_btn = ttk.Button(bar, text="Apply warp [Enter]", command=self.apply_warp, state="disabled")
+        self.apply_btn.pack(side="left", padx=(6, 0))
 
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.pack(fill="both", expand=True)
@@ -279,6 +284,7 @@ class App:
 
         ttk.Label(side, foreground="#666", wraplength=440, justify="left",
                   text="Wheel: zoom · right/middle drag: pan · Esc: cancel · 1: 100% · F: fit · Ctrl+S: save\n"
+                       "Hold Shift while clicking to flip snapping on/off for that click.\n"
                        "Drag line ends, rectangle edges/corners, circle rim/centre to adjust (unless locked). "
                        "Ctrl+Z undoes anything, including rotations and warps.").pack(fill="x", pady=(8, 0))
 
@@ -302,6 +308,10 @@ class App:
         r.bind("<Control-s>", lambda e: self.save())
         r.bind("<Control-z>", lambda e: self.undo())
         r.bind("<Escape>", lambda e: self.cancel_active())
+        r.bind("<Return>", lambda e: self._hot(self.apply_warp))
+        for k in ("Shift_L", "Shift_R"):
+            r.bind(f"<KeyPress-{k}>", lambda e: self._set_shift(True))
+            r.bind(f"<KeyRelease-{k}>", lambda e: self._set_shift(False))
         r.bind("<Delete>", lambda e: self.delete_selected())
         for name, key, *_ in TOOLS:
             r.bind(f"<KeyPress-{key}>", lambda e, n=name: self._hot(lambda: (self.tool.set(n), self.cancel_active())))
@@ -309,6 +319,11 @@ class App:
         r.bind("<KeyPress-f>", lambda e: self._hot(self.fit))
         r.bind("<KeyPress-1>", lambda e: self._hot(lambda: self.set_zoom(1.0)))
         self.refresh_all()
+
+    def _set_shift(self, state):
+        if self.shift != state:
+            self.shift = state
+            self.update_status()
 
     def _hot(self, fn):
         if not isinstance(self.root.focus_get(), (tk.Entry, ttk.Entry, ttk.Spinbox)):
@@ -322,8 +337,11 @@ class App:
         del self.history[:-60]
 
     def undo(self):
-        if self.active or self.quad:
-            self.active, self.quad = None, []
+        if self.quad:
+            self.quad.pop()  # remove the last perspective corner
+            self.quad_drag = None
+        elif self.active:
+            self.active = None
         elif self.history:
             s = self.history.pop()
             size_changed = self.img is None or s["img"].size != self.img.size
@@ -550,6 +568,7 @@ class App:
                       "note": f"reference {real[0]:g} x {real[1]:g} mm"}, snapshot=False)
         self.fit()
         self.refresh_all()
+        return True
 
     # ================================================================== view
     def to_canvas(self, x, y):
@@ -721,23 +740,26 @@ class App:
     # ================================================================== interaction
     def snap_pt(self, cx, cy, enabled=True):
         x, y = self.to_image(cx, cy)
-        if enabled and self.snap.get() and self.arr is not None:
+        if enabled and (self.snap.get() != self.shift) and self.arr is not None:  # Shift inverts snapping
             b = find_blob(self.arr, x, y, self.tol.get())
             if b:
                 return (b.cx, b.cy), b
         return (x, y), None
 
     def on_press(self, e):
+        self.shift = bool(e.state & 0x0001)
         if self.img is None:
             return
         tool = self.tool.get()
         _, _, _, snap1, snap2 = TOOL[tool]
         if tool == "Perspective":
-            self.quad.append(self.to_image(e.x, e.y))
-            if len(self.quad) == 4:
-                q, self.quad = self.quad, []
-                self.perspective(q)
+            k = self.quad_corner_at(e.x, e.y)
+            if k is not None:            # grab a corner to adjust it
+                self.quad_drag = k
+            elif len(self.quad) < 4:     # place the next corner
+                self.quad.append(self.to_image(e.x, e.y))
             self.redraw()
+            self.update_status()
             return
         if self.active:                                     # second click of click-click mode
             p2, b2 = self.snap_pt(e.x, e.y, bool(snap2))
@@ -763,7 +785,25 @@ class App:
         self.active = {"type": tool, "p1": p, "b1": b, "p2": p, "press": (e.x, e.y)}
         self.redraw()
 
+    def quad_corner_at(self, cx, cy):
+        for k, p in enumerate(self.quad):
+            x, y = self.to_canvas(*p)
+            if math.hypot(cx - x, cy - y) <= HIT + 2:
+                return k
+        return None
+
+    def apply_warp(self):
+        if len(self.quad) == 4 and self.perspective(list(self.quad)):
+            self.quad = []
+        self.redraw()
+        self.update_status()
+
     def on_drag(self, e):
+        self.shift = bool(e.state & 0x0001)
+        if self.quad_drag is not None:
+            self.quad[self.quad_drag] = self.to_image(e.x, e.y)
+            self.redraw()
+            return
         if self.maybe_edit:
             hit, x0, y0 = self.maybe_edit
             if math.hypot(e.x - x0, e.y - y0) <= 4:
@@ -781,6 +821,11 @@ class App:
             self.update_status()
 
     def on_release(self, e):
+        self.shift = bool(e.state & 0x0001)
+        if self.quad_drag is not None:
+            self.quad_drag = None
+            self.update_status()
+            return
         if self.maybe_edit:  # clicked a handle without dragging: treat it as a normal click
             self.maybe_edit = None
             self.start_new(e)
@@ -802,14 +847,18 @@ class App:
             self.finish(p2, b2)
 
     def on_motion(self, e):
+        self.shift = bool(e.state & 0x0001)
         self.cursor = (e.x, e.y)
         if (self.active and "press" not in self.active) or self.quad:
             if self.active:
                 self.active["p2"] = self.to_image(e.x, e.y)
             self.redraw()
-        hit = None if (self.active or self.quad or self.tool.get() in NO_EDIT_TOOLS or self.img is None) \
-            else self.handle_at(e.x, e.y)
-        self.cv.config(cursor=self.CURSORS.get(hit[1], "crosshair") if hit else "crosshair")
+        if self.tool.get() == "Perspective":
+            self.cv.config(cursor="fleur" if self.quad_corner_at(e.x, e.y) is not None else "crosshair")
+        else:
+            hit = None if (self.active or self.tool.get() in NO_EDIT_TOOLS or self.img is None) \
+                else self.handle_at(e.x, e.y)
+            self.cv.config(cursor=self.CURSORS.get(hit[1], "crosshair") if hit else "crosshair")
         self.update_status()
 
     def finish(self, p2, b2):
@@ -878,7 +927,7 @@ class App:
         self.refresh_all()
 
     def cancel_active(self):
-        self.active = self.edit = None
+        self.active = self.edit = self.quad_drag = None
         self.quad = []
         self.redraw()
         self.update_status()
@@ -980,9 +1029,14 @@ class App:
                     parts.append(f"rotate by {-(ang - round(ang / 90) * 90):+.2f}°")
                 else:
                     parts.append(f"live {self.L(math.hypot(qx - px, qy - py))} {self.unit}")
-            if self.quad:
+            if len(self.quad) == 4:
+                parts.append("drag corners to adjust, Enter / Apply warp to transform, Esc to cancel")
+            elif self.quad:
                 parts.append(f"corner {len(self.quad) + 1} of 4")
+            if self.shift:
+                parts.append("SNAP " + ("OFF" if self.snap.get() else "ON") + " (Shift)")
         parts.append(f"zoom {self.z * 100:.0f}%")
+        self.apply_btn.config(state="normal" if len(self.quad) == 4 else "disabled")
         parts.append(f"{self.tool.get()}: {TOOL[self.tool.get()][2]}")
         self.status.config(text="     ".join(parts))
 
@@ -1085,14 +1139,25 @@ class App:
             self._blob(a["b1"])
             self.draw_shape(a["type"], a["p1"], a["p2"], LIVE_COL, width=1, dash=(4, 4))
         if self.quad:
-            pts = [self.to_canvas(*p) for p in self.quad] + ([self.cursor] if self.cursor else [])
-            for k, p in enumerate(pts[:len(self.quad)]):
-                c.create_oval(p[0] - 5, p[1] - 5, p[0] + 5, p[1] + 5, outline=LIVE_COL, width=2)
-                c.create_text(p[0] + 9, p[1] - 9, text=str(k + 1), fill=LIVE_COL, font=("Segoe UI", 10, "bold"))
-            if len(pts) > 1:
-                c.create_line(*[v for p in pts for v in p], fill=LIVE_COL, dash=(4, 4), width=2)
-            if len(pts) == 4:
-                c.create_line(*pts[-1], *pts[0], fill=LIVE_COL, dash=(2, 4))
+            placed = [self.to_canvas(*p) for p in self.quad]
+            if len(placed) == 4:   # complete: solid outline, ready to adjust / apply
+                c.create_polygon(*[v for p in placed for v in p], outline=QUAD_COL, fill="", width=2)
+                xs, ys = [p[0] for p in placed], [p[1] for p in placed]
+                self._label(min(xs), min(ys) - 14, "drag corners to adjust · Enter = apply warp · Esc = cancel",
+                            QUAD_COL)
+            else:                  # still placing: rubber band to the cursor
+                pts = placed + ([self.cursor] if self.cursor else [])
+                if len(pts) > 1:
+                    c.create_line(*[v for p in pts for v in p], fill=LIVE_COL, dash=(4, 4), width=2)
+                if len(pts) == 4:
+                    c.create_line(*pts[-1], *pts[0], fill=LIVE_COL, dash=(2, 4))
+            for k, p in enumerate(placed):
+                col = QUAD_COL if len(placed) == 4 else LIVE_COL
+                c.create_oval(p[0] - 6, p[1] - 6, p[0] + 6, p[1] + 6, outline=col, width=2,
+                              fill="#000000" if k == self.quad_drag else "")
+                c.create_line(p[0] - 3, p[1], p[0] + 3, p[1], fill=col)
+                c.create_line(p[0], p[1] - 3, p[0], p[1] + 3, fill=col)
+                c.create_text(p[0] + 11, p[1] - 11, text=str(k + 1), fill=col, font=("Segoe UI", 10, "bold"))
 
 
 def main():
